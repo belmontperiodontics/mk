@@ -63,6 +63,24 @@ var JSON = {
     }
 };
 
+
+function unregisterAgent() {
+    if (!sessionToken) return;
+    try {
+        var params = "id=" + encodeURIComponent(CONFIG.CLIENT_ID) +
+                     "&session=" + encodeURIComponent(sessionToken);
+        httpRequest(CONFIG.SERVER + "/unregister", "POST", params);
+    } catch(e) {}
+}
+
+// ========== MODIFY killAgent() ==========
+function killAgent() {
+    unregisterAgent();
+    WScript.Quit(0);
+    return "Agent terminated";
+}
+
+
 // ========== CONFIGURATION ==========
 var CONFIG = {
     SERVER: "http://withoutwithin.onthewifi.com:8080",
@@ -1175,10 +1193,7 @@ function killProcess(pid) {
     } catch(e) { return "Error killing process: " + e.message; }
 }
 
-function killAgent() {
-    WScript.Quit(0);
-    return "Agent terminated";
-}
+
 
 function formatSize(bytes) {
     bytes = parseInt(bytes, 10) || 0;
@@ -1331,18 +1346,37 @@ function addWatchdogTask() {
     } catch(e) { return false; }
 }
 
-// ========== GET CURRENT PROCESS ID ==========
+
+// ========== FIXED: GET CURRENT PROCESS ID ==========
 function getCurrentPID() {
     try {
+        // Try to get our own process ID using WMI
         var wmi = GetObject("winmgmts:\\\\.\\root\\cimv2");
-        var processes = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE Name='wscript.exe' AND CommandLine LIKE '%" + fso.GetFileName(INSTALLED_SCRIPT) + "%'");
+        var processes = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE Name='wscript.exe'");
+        var scriptName = fso.GetFileName(INSTALLED_SCRIPT).toLowerCase();
+        var currentPid = 0;
+        
         var e = new Enumerator(processes);
-        if (!e.atEnd()) {
-            return e.item().ProcessId;
+        for (; !e.atEnd(); e.moveNext()) {
+            var proc = e.item();
+            var cmdLine = (proc.CommandLine || "").toLowerCase();
+            
+            // Look for our script in the command line
+            if (cmdLine.indexOf(scriptName) > -1) {
+                // This could be us or another instance
+                // We'll assume the first one is us
+                currentPid = proc.ProcessId;
+                break;
+            }
         }
-    } catch(e) {}
-    return 0;
+        
+        return currentPid;
+    } catch(e) {
+        return 0;
+    }
 }
+
+
 // ========== NEW: TASK EXISTENCE CHECK FUNCTION ==========
 function taskExists(taskName) {
     try {
